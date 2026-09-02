@@ -3,45 +3,87 @@
 #include <SPI.h>
 
 // Hardware Pin Definitions
-const int FSYNC_PIN = 7; // Frame Synchronization (Chip Select)
-const int SCK_PIN = 10;  // Serial Clock
-const int MOSI_PIN = 11; // Master Out Slave In (Data out to AD9833)
-const int MISO_PIN = -1; // AD9833 has no MISO output, set to -1
-const int ADC_PIN = 2;   // GPIO 2 for ADC sampling
+const int FSYNC_PIN = 7;
+const int SCK_PIN = 10;
+const int MOSI_PIN = 11;
+const int MISO_PIN = -1;
+const int ADC_PIN = 2;
 
-// FFT Parameters
-const uint16_t SAMPLES = 1024;
-const double SAMPLING_FREQUENCY = 10000.0; // 10kHz sampling frequency
-const unsigned long SAMPLING_PERIOD_US = round(1000000.0 / SAMPLING_FREQUENCY);
+// Sampling Parameters (ADC DMA continuous mode)
+const uint16_t SAMPLES = 2048;
+const uint32_t SAMPLING_FREQUENCY = 50000; // 50 kSPS
+const size_t DMA_BUFFER_SIZE = 1024;       // frames per DMA buffer
+const size_t DMA_BUFFER_COUNT = 8;
+
+// ---------------------------------------------------------------------------
+// Binary streaming frame format (little-endian, 28-byte header + payload)
+//   [ 0] u32 magic          0xAA55AD98
+//   [ 4] u16 version        1
+//   [ 6] u32 seq            frame sequence number (drop detection)
+//   [10] u32 sampling_rate  -> pyfar.Signal sampling_rate
+//   [14] u32 n_samples      -> pyfar.Signal time_data length
+//   [18] u16 n_channels     1 (reserved)
+//   [20] u32 time_stamp_us  esp_timer timestamp
+//   [24] f32 full_scale     ADC full-scale reference (reserved for scaling)
+//   [28] f32 x n_samples    time_data (raw ADC codes as float32)
+// ---------------------------------------------------------------------------
+const uint32_t FRAME_MAGIC = 0xAA55AD98;
+const uint16_t FRAME_VERSION = 1;
+const uint16_t FRAME_HEADER_SIZE = 28;
+static uint32_t frame_seq = 0;
 
 double vReal[SAMPLES];
 double vImag[SAMPLES];
 
-// Instantiate ArduinoFFT object using templates (arduinoFFT v2.x)
+// Instantiate ArduinoFFT object
 ArduinoFFT<double> FFT =
-    ArduinoFFT<double>(vReal, vImag, SAMPLES, SAMPLING_FREQUENCY);
+    ArduinoFFT<double>(vReal, vImag, SAMPLES, (double)SAMPLING_FREQUENCY);
 
-/**
- * Sends a 16-bit data word to the AD9833 via SPI.
- * @param data The 16-bit word to transmit.
- */
 void writeAD9833(uint16_t data) {
-  digitalWrite(FSYNC_PIN, LOW);  // Pull FSYNC low to start transmission
-  SPI.transfer16(data);          // Send 16-bit data
-  digitalWrite(FSYNC_PIN, HIGH); // Pull FSYNC high to end transmission
+  digitalWrite(FSYNC_PIN, LOW);
+  SPI.transfer16(data);
+  digitalWrite(FSYNC_PIN, HIGH);
+}
+
+static void sendFrame(const double *samples, uint16_t n) {
+  uint8_t header[FRAME_HEADER_SIZE];
+  uint32_t ts = (uint32_t)esp_timer_get_time();
+
+  header[0] = FRAME_MAGIC & 0xFF;
+  header[1] = (FRAME_MAGIC >> 8) & 0xFF;
+  header[2] = (FRAME_MAGIC >> 16) & 0xFF;
+  header[3] = (FRAME_MAGIC >> 24) & 0xFF;
+  header[4] = FRAME_VERSION & 0xFF;
+  header[5] = (FRAME_VERSION >> 8) & 0xFF;
+  uint32_t seq = frame_seq++;
+  memcpy(&header[6], &seq, 4);
+  uint32_t fs = SAMPLING_FREQUENCY;
+  memcpy(&header[10], &fs, 4);
+  uint32_t ns = n;
+  memcpy(&header[14], &ns, 4);
+  uint16_t nch = 1;
+  memcpy(&header[18], &nch, 2);
+  memcpy(&header[20], &ts, 4);
+  float full_scale = 4096.0f; // LSB full-scale reference
+  memcpy(&header[24], &full_scale, 4);
+
+  static float payload[SAMPLES];
+  for (int i = 0; i < n; i++)
+    payload[i] = (float)samples[i];
+
+  Serial.write(header, FRAME_HEADER_SIZE);
+  Serial.write((uint8_t *)payload, n * sizeof(float));
+  Serial.flush(); // CDC: flush after complete frame
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n--- AD9833 & ADC FFT Test Bench ---");
+  Serial.println("\n--- AD9833 ADC DMA 50kSPS Streaming Bench ---");
   Serial.printf("PSRAM size: %d bytes\n", ESP.getPsramSize());
-  Serial.printf("Flash size: %d bytes\n", ESP.getFlashChipSize());
 
   pinMode(FSYNC_PIN, OUTPUT);
   digitalWrite(FSYNC_PIN, HIGH);
-
-  // Initialize the SPI interface for ESP32-S3
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, FSYNC_PIN);
 
   SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE2));
@@ -52,126 +94,283 @@ void setup() {
   writeAD9833(0x2000);
   SPI.endTransaction();
 
-  // Configure ADC pin
-  pinMode(ADC_PIN, INPUT);
-  analogReadResolution(12); // ESP32-S3 typically uses 12-bit ADC
+  // NOTE: do NOT call analogRead()/analogReadMilliVolts() here — it puts
+  // ADC1 into oneshot mode and makes analogContinuous() abort.
+  const uint8_t adc_pins[] = {ADC_PIN};
+  analogContinuousSetAtten(ADC_11db); // full range
+  analogContinuousSetWidth(12);       // 12-bit (0-4095)
+  if (!analogContinuous(adc_pins, 1, 1, SAMPLING_FREQUENCY, NULL)) {
+    Serial.println("# Error: analogContinuous init failed!");
+  }
+  analogContinuousStart();
+
+  adc_continuous_result_t *dbg = NULL;
+  for (int i = 0; i < 5; i++) {
+    int dma_raw = -1, dma_mv = -1;
+    if (analogContinuousRead(&dbg, 100)) {
+      dma_raw = dbg->avg_read_raw;
+      dma_mv = dbg->avg_read_mvolts;
+    }
+    Serial.printf("#   pin=%u ch=%u dma_raw=%d dma_mV=%d\n",
+                  dbg ? dbg->pin : 255, dbg ? dbg->channel : 255, dma_raw,
+                  dma_mv);
+    delay(200);
+  }
 }
 
-void analyzeADC() {
-  Serial.println("Starting ADC sampling...");
-  double sumBefore = 0;
+static int get_folded_bin(int bin, int N) {
+  bin = bin % N;
+  if (bin > N / 2) {
+    bin = N - bin;
+  }
+  return bin;
+}
 
-  // Sample the signal
-  for (int i = 0; i < SAMPLES; i++) {
-    unsigned long startTime = micros();
-    double val = analogRead(ADC_PIN);
-    vReal[i] = val;
-    vImag[i] = 0.0;
-    sumBefore += val;
-    while ((micros() - startTime) < SAMPLING_PERIOD_US) {
-      // Wait for next sample interval based on SAMPLING_FREQUENCY
+void analyzeAndStream() {
+  double *raw_samples = (double *)malloc(SAMPLES * sizeof(double));
+  if (!raw_samples) {
+    Serial.println("# Error: malloc failed");
+    return;
+  }
+
+  // Collect one block from the DMA queue (already hardware-timed)
+  adc_continuous_result_t *adc_result = NULL;
+  size_t got = 0;
+  uint32_t t0 = millis();
+  while (got < SAMPLES) {
+    if (analogContinuousRead(&adc_result, 100)) {
+      raw_samples[got++] = (double)adc_result->avg_read_raw;
+    } else if (millis() - t0 > 2000) {
+      Serial.println("# Error: ADC DMA timeout");
+      free(raw_samples);
+      return;
     }
   }
 
-  // Remove DC bias (average value)
-  double mean = sumBefore / SAMPLES;
+  // --- Stream raw block to host (binary frame) ---
+  sendFrame(raw_samples, SAMPLES);
+
+  // --- On-board IEEE 1241 analysis (text output, '#' prefixed) ---
   for (int i = 0; i < SAMPLES; i++) {
-    vReal[i] -= mean;
+    vReal[i] = raw_samples[i];
+    vImag[i] = 0.0;
   }
-
-  // Apply Windowing to minimize spectral leakage (Blackman-Harris is good for
-  // high dynamic range)
-  FFT.windowing(FFTWindow::Blackman_Harris, FFTDirection::Forward);
-
-  // Compute FFT
+  FFT.windowing(FFTWindow::Hann, FFTDirection::Forward);
   FFT.compute(FFTDirection::Forward);
 
-  // Convert complex to magnitude
-  FFT.complexToMagnitude();
-
-  // Variables to calculate SNR, SNDR, ENOB
-  double max_mag = 0;
+  double max_mag_sq = 0.0;
   int fund_bin = 0;
-
-  // Find fundamental frequency bin (ignore very low frequency noise and DC
-  // around bin 0-2)
-  for (int i = 3; i < (SAMPLES / 2); i++) {
-    if (vReal[i] > max_mag) {
-      max_mag = vReal[i];
+  for (int i = 4; i < SAMPLES / 2; i++) {
+    double mag_sq = vReal[i] * vReal[i] + vImag[i] * vImag[i];
+    if (mag_sq > max_mag_sq) {
+      max_mag_sq = mag_sq;
       fund_bin = i;
     }
   }
 
-  double signal_energy = 0;
-  double noise_energy = 0;
-  double distortion_energy = 0;
-  double max_spur_energy = 0;
+  double omega = 2.0 * PI * fund_bin / SAMPLES;
+  double A = 0, B = 0, C = 0; // Model: y = A*cos(w*n) + B*sin(w*n) + C
 
-  // Use squared magnitude for power/energy calculations
-  int wing_size = 4; // Spectral leakage wings around the peak
+  auto solve3 = [&](double w, double &a_out, double &b_out, double &c_out) {
+    double m[3][3] = {0};
+    double yv[3] = {0};
+    for (int n = 0; n < SAMPLES; n++) {
+      double c = cos(w * n), s = sin(w * n), y = raw_samples[n];
+      m[0][0] += c * c;
+      m[0][1] += c * s;
+      m[0][2] += c;
+      m[1][0] += c * s;
+      m[1][1] += s * s;
+      m[1][2] += s;
+      m[2][0] += c;
+      m[2][1] += s;
+      m[2][2] += 1.0;
+      yv[0] += y * c;
+      yv[1] += y * s;
+      yv[2] += y;
+    }
+    double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+                 m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                 m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    a_out = (yv[0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+             m[0][1] * (yv[1] * m[2][2] - m[1][2] * yv[2]) +
+             m[0][2] * (yv[1] * m[2][1] - m[1][1] * yv[2])) /
+            det;
+    b_out = (m[0][0] * (yv[1] * m[2][2] - m[1][2] * yv[2]) -
+             yv[0] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+             m[0][2] * (m[1][0] * yv[2] - yv[1] * m[2][0])) /
+            det;
+    c_out = (m[0][0] * (m[1][1] * yv[2] - yv[1] * m[2][1]) -
+             m[0][1] * (m[1][0] * yv[2] - yv[1] * m[2][0]) +
+             yv[0] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])) /
+            det;
+  };
 
-  for (int i = 3; i < (SAMPLES / 2); i++) {
-    double energy = vReal[i] * vReal[i];
+  solve3(omega, A, B, C);
 
-    // Check if within fundamental signal band
-    if (i >= fund_bin - wing_size && i <= fund_bin + wing_size) {
-      signal_energy += energy;
-    } else {
-      // Find maximum spur energy for SFDR
-      if (energy > max_spur_energy) {
-        max_spur_energy = energy;
-      }
+  // 4-Parameter Iteration (Newton-Raphson)
+  for (int iter = 0; iter < 10; iter++) {
+    double m[4][4] = {0};
+    double yv[4] = {0};
+    for (int n = 0; n < SAMPLES; n++) {
+      double arg = omega * n;
+      double c_val = cos(arg), s_val = sin(arg);
+      double d_omega = -A * n * s_val + B * n * c_val;
+      double y_est = A * c_val + B * s_val + C;
+      double res = raw_samples[n] - y_est;
 
-      // Check if it's a harmonic (2nd to 10th harmonics typical for distortion
-      // calculation)
-      bool isHarmonic = false;
-      for (int h = 2; h <= 10; h++) {
-        int harm_bin = fund_bin * h;
-        if (harm_bin >= (SAMPLES / 2))
-          break;
-        if (i >= harm_bin - wing_size && i <= harm_bin + wing_size) {
-          isHarmonic = true;
-          break;
-        }
-      }
-
-      if (isHarmonic) {
-        distortion_energy += energy;
-      } else {
-        noise_energy += energy;
+      double row[4] = {c_val, s_val, 1.0, d_omega};
+      for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++)
+          m[i][j] += row[i] * row[j];
+        yv[i] += res * row[i];
       }
     }
+
+    for (int i = 0; i < 4; i++) {
+      int pivot = i;
+      for (int j = i + 1; j < 4; j++)
+        if (fabs(m[j][i]) > fabs(m[pivot][i]))
+          pivot = j;
+      for (int j = 0; j < 4; j++)
+        std::swap(m[i][j], m[pivot][j]);
+      std::swap(yv[i], yv[pivot]);
+      double piv = m[i][i];
+      if (fabs(piv) < 1e-15)
+        continue;
+      for (int j = i; j < 4; j++)
+        m[i][j] /= piv;
+      yv[i] /= piv;
+      for (int j = 0; j < 4; j++) {
+        if (i != j) {
+          double factor = m[j][i];
+          for (int k = i; k < 4; k++)
+            m[j][k] -= factor * m[i][k];
+          yv[j] -= factor * yv[i];
+        }
+      }
+    }
+    A += yv[0];
+    B += yv[1];
+    C += yv[2];
+    omega += yv[3];
+    if (fabs(yv[3]) < 1e-10)
+      break;
   }
 
-  // Prevent divide by zero issues
-  if (noise_energy <= 0)
-    noise_energy = 1e-10;
-  if (distortion_energy <= 0)
-    distortion_energy = 1e-10;
-  if (signal_energy <= 0)
-    signal_energy = 1e-10;
-  if (max_spur_energy <= 0)
-    max_spur_energy = 1e-10;
+  double amplitude = sqrt(A * A + B * B);
+  double phase = atan2(-B, A);
 
-  double snr = 10 * log10(signal_energy / noise_energy);
-  double thd = 10 * log10(distortion_energy / signal_energy);
-  double sndr = 10 * log10(signal_energy / (noise_energy + distortion_energy));
-  double enob = (sndr - 1.76) / 6.02;
-  double sfdr = 10 * log10((max_mag * max_mag) / max_spur_energy);
+  Serial.println("# --- IEEE 1241 4-Param Sine Fit ---");
+  Serial.printf("# Fitted Frequency  : %.4f Hz\n",
+                (omega * SAMPLING_FREQUENCY) / (2.0 * PI));
+  Serial.printf("# Refined DC Offset : %.3f LSB\n", C);
+  Serial.printf("# Fitted Amplitude  : %.3f LSB\n", amplitude);
+  Serial.printf("# Fitted Phase(rad) : %.4f\n", phase);
 
-  double fund_freq = (fund_bin * SAMPLING_FREQUENCY) / SAMPLES;
+  // --- Golden Reference & LUT Training ---
+  double *ideal_samples = (double *)malloc(SAMPLES * sizeof(double));
+  const int ADC_MAX_CODE = 4096;
+  double *LUT = (double *)calloc(ADC_MAX_CODE, sizeof(double));
+  int *count = (int *)calloc(ADC_MAX_CODE, sizeof(int));
+  if (!ideal_samples || !LUT || !count) {
+    free(raw_samples);
+    return;
+  }
 
-  Serial.println("--- Analysis Results ---");
-  Serial.printf("Fundamental Freq: %.2f Hz\n", fund_freq);
-  Serial.printf("SNR:              %.2f dB\n", snr);
-  Serial.printf("THD:              %.2f dB\n", thd);
-  Serial.printf("SNDR(SINAD):      %.2f dB\n", sndr);
-  Serial.printf("ENOB:             %.2f bits\n", enob);
-  Serial.printf("SFDR:             %.2f dBc\n", sfdr);
-  Serial.println("------------------------\n");
+  for (int n = 0; n < SAMPLES; n++)
+    ideal_samples[n] = amplitude * cos(omega * n + phase);
+
+  for (int n = 0; n < SAMPLES; n++) {
+    int code = (int)raw_samples[n];
+    if (code < 0)
+      code = 0;
+    if (code >= ADC_MAX_CODE)
+      code = ADC_MAX_CODE - 1;
+    LUT[code] += (ideal_samples[n] - (raw_samples[n] - C));
+    count[code]++;
+  }
+  for (int i = 0; i < ADC_MAX_CODE; i++)
+    if (count[i] > 0)
+      LUT[i] /= count[i];
+
+  // --- Calibrated metrics ---
+  double *calibrated_samples = (double *)malloc(SAMPLES * sizeof(double));
+  for (int n = 0; n < SAMPLES; n++) {
+    int code = (int)raw_samples[n];
+    if (code < 0)
+      code = 0;
+    if (code >= ADC_MAX_CODE)
+      code = ADC_MAX_CODE - 1;
+    calibrated_samples[n] = (raw_samples[n] - C) + LUT[code];
+    vReal[n] = calibrated_samples[n];
+    vImag[n] = 0.0;
+  }
+
+  FFT.windowing(FFTWindow::Hann, FFTDirection::Forward);
+  FFT.compute(FFTDirection::Forward);
+  FFT.complexToMagnitude();
+
+  const int num_bins = SAMPLES / 2;
+  double *pow_spec = (double *)malloc(num_bins * sizeof(double));
+  double *noise_m = (double *)malloc(num_bins * sizeof(double));
+  for (int i = 0; i < num_bins; i++) {
+    pow_spec[i] = vReal[i] * vReal[i];
+    noise_m[i] = 1.0;
+  }
+
+  int ws = 3;
+  double p_sig = 0, p_harm = 0, p_noi = 0, p_spur = 0;
+  int sig_b = floor((omega * SAMPLES) / (2.0 * PI) + 0.5);
+  for (int i = sig_b - ws; i <= sig_b + ws; i++)
+    if (i >= 0 && i < num_bins) {
+      p_sig += pow_spec[i];
+      noise_m[i] = 0;
+    }
+  for (int i = 0; i <= ws; i++)
+    noise_m[i] = 0;
+
+  for (int h = 2; h <= 6; h++) {
+    int hb = get_folded_bin(sig_b * h, SAMPLES);
+    for (int i = hb - ws; i <= hb + ws; i++)
+      if (i >= 0 && i < num_bins) {
+        if (noise_m[i] == 1.0)
+          p_harm += pow_spec[i];
+        noise_m[i] = 0;
+      }
+  }
+
+  double pmax = 0;
+  int spb = 0;
+  for (int i = 0; i < num_bins; i++)
+    if (noise_m[i] == 1.0) {
+      p_noi += pow_spec[i];
+      if (pow_spec[i] > pmax) {
+        pmax = pow_spec[i];
+        spb = i;
+      }
+    }
+  for (int i = spb - ws; i <= spb + ws; i++)
+    if (i >= 0 && i < num_bins && noise_m[i] == 1.0)
+      p_spur += pow_spec[i];
+
+  double snr = 10 * log10(p_sig / p_noi), thd = 10 * log10(p_harm / p_sig),
+         sndr = 10 * log10(p_sig / (p_noi + p_harm)),
+         enob = (sndr - 1.76) / 6.02;
+
+  Serial.println("# --- Calibrated Metrics ---");
+  Serial.printf("# SNR: %.2f dB, THD: %.2f dB, SNDR: %.2f dB, ENOB: %.2f "
+                "bits\n",
+                snr, thd, sndr, enob);
+  Serial.println("# =========================");
+
+  free(raw_samples);
+  free(ideal_samples);
+  free(LUT);
+  free(count);
+  free(calibrated_samples);
+  free(pow_spec);
+  free(noise_m);
 }
 
-void loop() {
-  analyzeADC();
-  delay(3000); // Wait 3 seconds before next capture and analysis
-}
+void loop() { analyzeAndStream(); }
