@@ -3,3 +3,13 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Machine-generated build metadata and Python caches
+.cache/
+compile_commands.json
+__pycache__/
+*.py[cod]
+
+# Local acquisition recordings
+*.tdms
+*.tdms_index

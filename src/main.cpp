@@ -1,53 +1,119 @@
-#include "arduinoFFT.h"
 #include <Arduino.h>
-#include <SPI.h>
+#include <Wire.h>
+#include <driver/i2s.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <cstring>
 
-// Hardware Pin Definitions
-const int FSYNC_PIN = 7;
-const int SCK_PIN = 10;
-const int MOSI_PIN = 11;
-const int MISO_PIN = -1;
-const int ADC_PIN = 2;
+#include "display.h"
+#include "spectrum.h"
 
-// Sampling Parameters (ADC DMA continuous mode)
-const uint16_t SAMPLES = 2048;
-const uint32_t SAMPLING_FREQUENCY = 50000; // 50 kSPS
-const size_t DMA_BUFFER_SIZE = 1024;       // frames per DMA buffer
-const size_t DMA_BUFFER_COUNT = 8;
+// ES3C28P / ES3N28P 2.8" ESP32-S3 display module (CYD branch).
+// Microphone path: ES8311 codec (ADC) -> I2S -> ESP32-S3, streamed over native USB CDC.
+//
+//   ES8311 control (I2C, 0x18)  SDA -> GPIO16, SCL -> GPIO15
+//   MCLK  (ESP32 -> ES8311)     GPIO4
+//   BCLK  (ESP32 -> ES8311)     GPIO5
+//   LRCK  (ESP32 -> ES8311)     GPIO7
+//   SDOUT (ES8311 -> ESP32)     GPIO6
+//   Speaker amp enable          GPIO1 (active low, held off)
+//
+// Pin source: doc/ES3C28P_pinout.md in SimpleTrack-Logger.
+// The ES8311 is an I2S slave: the ESP32 supplies MCLK, BCLK and LRCK, and the
+// codec must be configured over I2C before any audio appears on SDOUT.
+//
+// The firmware reads 24-bit PCM from the codec, packs it as signed
+// little-endian 24-bit samples, and streams binary frames to the PC over USB.
 
-// ---------------------------------------------------------------------------
-// Binary streaming frame format (little-endian, 28-byte header + payload)
-//   [ 0] u32 magic          0xAA55AD98
-//   [ 4] u16 version        1
-//   [ 6] u32 seq            frame sequence number (drop detection)
-//   [10] u32 sampling_rate  -> pyfar.Signal sampling_rate
-//   [14] u32 n_samples      -> pyfar.Signal time_data length
-//   [18] u16 n_channels     1 (reserved)
-//   [20] u32 time_stamp_us  esp_timer timestamp
-//   [24] f32 full_scale     ADC full-scale reference (reserved for scaling)
-//   [28] f32 x n_samples    time_data (raw ADC codes as float32)
-// ---------------------------------------------------------------------------
-const uint32_t FRAME_MAGIC = 0xAA55AD98;
-const uint16_t FRAME_VERSION = 1;
-const uint16_t FRAME_HEADER_SIZE = 28;
+constexpr i2s_port_t I2S_PORT = I2S_NUM_0;
+constexpr int I2S_MCLK_PIN = 4;
+constexpr int I2S_BCLK_PIN = 5;
+constexpr int I2S_WS_PIN = 7;
+constexpr int I2S_DATA_PIN = 6;
+constexpr int AMP_EN_PIN = 1;          // active low
+constexpr int CODEC_SDA_PIN = 16;
+constexpr int CODEC_SCL_PIN = 15;
+constexpr uint8_t ES8311_ADDR = 0x18;
+constexpr bool MIC_USE_LEFT_CHANNEL = true; // ES8311 is mono; data on left slot
+
+constexpr uint32_t SAMPLE_RATE_HZ = 44100;
+constexpr uint32_t MCLK_MULTIPLE = 256;     // MCLK = 256 * fs, standard for ES8311
+constexpr uint16_t SAMPLES_PER_FRAME = 2048;
+constexpr uint16_t CHANNELS = 1;
+
+// ES8311 analog mic gain settings. The values come from the ESPHome ES8311
+// driver; they have not been checked against the ES8311 datasheet or measured.
+constexpr uint8_t ES8311_REG_MIC_PGA = 0x14; // analog MIC, PGA gain
+constexpr uint8_t ES8311_MIC_PGA_VAL = 0x1A;
+constexpr uint8_t ES8311_REG_MIC_GAIN = 0x16; // ADC mic gain (0 dB assumed)
+constexpr uint8_t ES8311_MIC_GAIN_VAL = 0x00;
+constexpr uint8_t ES8311_REG_ADC_VOL = 0x17;
+constexpr uint8_t ES8311_ADC_VOL_VAL = 0xC8;
+
+// Binary streaming frame format:
+//   [ 0] u32 magic         0xAA55AD98
+//   [ 4] u16 version       3
+//   [ 6] u32 seq           frame sequence number
+//   [10] u32 sampling_rate 44100
+//   [14] u32 n_samples     per channel
+//   [18] u16 n_channels    1
+//   [20] u32 time_stamp_us esp_timer timestamp
+//   [24] f32 full_scale    2^23 for signed 24-bit PCM
+//   [28] u32 payload_bytes packed payload size in bytes
+//   [32] 24-bit payload    packed little-endian PCM samples
+constexpr uint32_t FRAME_MAGIC = 0xAA55AD98;
+constexpr uint16_t FRAME_VERSION = 3;
+constexpr uint16_t FRAME_HEADER_SIZE = 32;
+constexpr float MIC_FULL_SCALE = 8388608.0f; // 2^23
+
+// Streaming every frame over native USB CDC paces the capture loop: one 6 KB
+// frame takes ~64 ms to drain, which is longer than the 46 ms it takes to
+// record it. Keep it off while the on-screen meter runs; turn it on for bench
+// captures with python/ad9833_stream.py.
+constexpr bool USB_STREAM_ENABLE = false;
+
 static uint32_t frame_seq = 0;
+static int32_t sample_buffer[SAMPLES_PER_FRAME];
+static uint8_t payload[SAMPLES_PER_FRAME * 3];
 
-double vReal[SAMPLES];
-double vImag[SAMPLES];
+// Capture runs on the Arduino core-1 task so I2S is never starved; the FFT and
+// display run on core 0. A one-deep queue means the analyser always works on
+// the newest block and simply skips blocks it cannot keep up with.
+static QueueHandle_t audio_queue = nullptr;
+static int32_t analysis_block[SAMPLES_PER_FRAME];  // owned by analysisTask
 
-// Instantiate ArduinoFFT object
-ArduinoFFT<double> FFT =
-    ArduinoFFT<double>(vReal, vImag, SAMPLES, (double)SAMPLING_FREQUENCY);
+// Timing instrumentation, printed once every 5 s.
+static volatile uint32_t stat_analysis_us = 0;
 
-void writeAD9833(uint16_t data) {
-  digitalWrite(FSYNC_PIN, LOW);
-  SPI.transfer16(data);
-  digitalWrite(FSYNC_PIN, HIGH);
+static void analysisTask(void *) {
+  for (;;) {
+    display::pollTouch();
+    if (xQueueReceive(audio_queue, analysis_block, pdMS_TO_TICKS(20)) != pdTRUE) {
+      continue;
+    }
+    const int64_t t0 = esp_timer_get_time();
+    spectrum::pushSamples(analysis_block, SAMPLES_PER_FRAME);
+    if (spectrum::hasNewSpectrum()) {
+      display::update(spectrum::dbaBins(), spectrum::kBinCount,
+                      spectrum::binHz(), spectrum::dba(), spectrum::spl(),
+                      spectrum::peakSpl());
+    }
+    stat_analysis_us = static_cast<uint32_t>(esp_timer_get_time() - t0);
+    // Keep the core-0 idle task alive so the task watchdog does not fire.
+    vTaskDelay(1);
+  }
 }
 
-static void sendFrame(const double *samples, uint16_t n) {
+static void packInt24LE(uint8_t *dst, int32_t sample) {
+  dst[0] = static_cast<uint8_t>(sample & 0xFF);
+  dst[1] = static_cast<uint8_t>((sample >> 8) & 0xFF);
+  dst[2] = static_cast<uint8_t>((sample >> 16) & 0xFF);
+}
+
+static void sendFrame24(const uint8_t *packed_samples, uint16_t n_samples) {
   uint8_t header[FRAME_HEADER_SIZE];
-  uint32_t ts = (uint32_t)esp_timer_get_time();
+  uint32_t ts = static_cast<uint32_t>(esp_timer_get_time());
 
   header[0] = FRAME_MAGIC & 0xFF;
   header[1] = (FRAME_MAGIC >> 8) & 0xFF;
@@ -55,322 +121,225 @@ static void sendFrame(const double *samples, uint16_t n) {
   header[3] = (FRAME_MAGIC >> 24) & 0xFF;
   header[4] = FRAME_VERSION & 0xFF;
   header[5] = (FRAME_VERSION >> 8) & 0xFF;
-  uint32_t seq = frame_seq++;
-  memcpy(&header[6], &seq, 4);
-  uint32_t fs = SAMPLING_FREQUENCY;
-  memcpy(&header[10], &fs, 4);
-  uint32_t ns = n;
-  memcpy(&header[14], &ns, 4);
-  uint16_t nch = 1;
-  memcpy(&header[18], &nch, 2);
-  memcpy(&header[20], &ts, 4);
-  float full_scale = 4096.0f; // LSB full-scale reference
-  memcpy(&header[24], &full_scale, 4);
 
-  static float payload[SAMPLES];
-  for (int i = 0; i < n; i++)
-    payload[i] = (float)samples[i];
+  uint32_t seq = frame_seq++;
+  memcpy(&header[6], &seq, sizeof(seq));
+
+  uint32_t fs = SAMPLE_RATE_HZ;
+  memcpy(&header[10], &fs, sizeof(fs));
+
+  uint32_t ns = n_samples;
+  memcpy(&header[14], &ns, sizeof(ns));
+
+  uint16_t nch = CHANNELS;
+  memcpy(&header[18], &nch, sizeof(nch));
+
+  memcpy(&header[20], &ts, sizeof(ts));
+  memcpy(&header[24], &MIC_FULL_SCALE, sizeof(MIC_FULL_SCALE));
+  uint32_t payload_bytes = n_samples * CHANNELS * 3;
+  memcpy(&header[28], &payload_bytes, sizeof(payload_bytes));
 
   Serial.write(header, FRAME_HEADER_SIZE);
-  Serial.write((uint8_t *)payload, n * sizeof(float));
-  Serial.flush(); // CDC: flush after complete frame
+  Serial.write(packed_samples, payload_bytes);
+  Serial.flush();
+}
+
+static bool es8311Write(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(ES8311_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+// Register sequence follows the ESPHome ES8311 driver for MCLK = 256 * fs.
+// Clock divider values for 44.1 kHz with MCLK = 11.2896 MHz are my reading of
+// that driver; they are not confirmed against the datasheet. Verify on hardware.
+static bool setupES8311() {
+  bool ok = true;
+
+  ok &= es8311Write(0x00, 0x1F); // reset
+  delay(20);
+  ok &= es8311Write(0x00, 0x00); // release reset
+
+  // Clock: MCLK from the MCLK pin, pre_div = 1, pre_mult = 1, single-speed
+  ok &= es8311Write(0x01, 0x3F);
+  ok &= es8311Write(0x02, 0x00);
+  ok &= es8311Write(0x03, 0x10); // fs_mode = 0, adc_osr
+  ok &= es8311Write(0x04, 0x10); // dac_osr
+  ok &= es8311Write(0x05, 0x00); // adc_div = 1, dac_div = 1
+  ok &= es8311Write(0x06, 0x03); // bclk_div = 4 (BCLK = MCLK / 4 = 64 * fs)
+  ok &= es8311Write(0x07, 0x00); // LRCK divider high
+  ok &= es8311Write(0x08, 0xFF); // LRCK divider low (256 * fs MCLK)
+
+  // Format: 24-bit in and out, I2S
+  ok &= es8311Write(0x09, 0x00);
+  ok &= es8311Write(0x0A, 0x00);
+
+  // Analog microphone input
+  ok &= es8311Write(ES8311_REG_MIC_PGA, ES8311_MIC_PGA_VAL);
+  ok &= es8311Write(ES8311_REG_MIC_GAIN, ES8311_MIC_GAIN_VAL);
+  ok &= es8311Write(ES8311_REG_ADC_VOL, ES8311_ADC_VOL_VAL);
+
+  // Power up
+  ok &= es8311Write(0x0D, 0x01);
+  ok &= es8311Write(0x0E, 0x02);
+  ok &= es8311Write(0x12, 0x00);
+  ok &= es8311Write(0x13, 0x10);
+  ok &= es8311Write(0x1C, 0x6A);
+  ok &= es8311Write(0x37, 0x08);
+  ok &= es8311Write(0x00, 0x80); // power-on
+
+  return ok;
+}
+
+static bool setupI2SMic() {
+  i2s_config_t config;
+  memset(&config, 0, sizeof(config));
+  config.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX);
+  config.sample_rate = SAMPLE_RATE_HZ;
+  config.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
+  config.channel_format = MIC_USE_LEFT_CHANNEL ? I2S_CHANNEL_FMT_ONLY_LEFT
+                                               : I2S_CHANNEL_FMT_ONLY_RIGHT;
+  config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  config.dma_buf_count = 16;
+  config.dma_buf_len = 256;
+  config.use_apll = true;
+  config.tx_desc_auto_clear = false;
+  config.fixed_mclk = SAMPLE_RATE_HZ * MCLK_MULTIPLE; // MCLK output for the codec
+
+  i2s_pin_config_t pins;
+  memset(&pins, 0, sizeof(pins));
+  pins.mck_io_num = I2S_MCLK_PIN;
+  pins.bck_io_num = I2S_BCLK_PIN;
+  pins.ws_io_num = I2S_WS_PIN;
+  pins.data_out_num = I2S_PIN_NO_CHANGE;
+  pins.data_in_num = I2S_DATA_PIN;
+
+  esp_err_t err = i2s_driver_install(I2S_PORT, &config, 0, nullptr);
+  if (err != ESP_OK) {
+    Serial.printf("# error: i2s_driver_install failed: %d\n", err);
+    return false;
+  }
+
+  err = i2s_set_pin(I2S_PORT, &pins);
+  if (err != ESP_OK) {
+    Serial.printf("# error: i2s_set_pin failed: %d\n", err);
+    return false;
+  }
+
+  i2s_zero_dma_buffer(I2S_PORT);
+  return true;
+}
+
+static bool readMicFrame(int32_t *dst, size_t n_samples) {
+  size_t bytes_needed = n_samples * sizeof(int32_t);
+  size_t bytes_read = 0;
+  uint8_t *write_ptr = reinterpret_cast<uint8_t *>(dst);
+
+  while (bytes_read < bytes_needed) {
+    size_t chunk = 0;
+    esp_err_t err = i2s_read(I2S_PORT, write_ptr + bytes_read,
+                             bytes_needed - bytes_read, &chunk, portMAX_DELAY);
+    if (err != ESP_OK) {
+      Serial.printf("# error: i2s_read failed: %d\n", err);
+      return false;
+    }
+    if (chunk == 0) {
+      continue;
+    }
+    bytes_read += chunk;
+  }
+  return true;
+}
+
+static bool captureFrame() {
+  if (!readMicFrame(sample_buffer, SAMPLES_PER_FRAME)) {
+    delay(10);
+    return false;
+  }
+
+  if (USB_STREAM_ENABLE) {
+    for (uint16_t i = 0; i < SAMPLES_PER_FRAME; i++) {
+      // The codec sends 24-bit samples left-justified in a 32-bit I2S slot.
+      int32_t sample24 = sample_buffer[i] >> 8;
+      packInt24LE(&payload[i * 3], sample24);
+    }
+    sendFrame24(payload, SAMPLES_PER_FRAME);
+  }
+  return true;
 }
 
 void setup() {
-  Serial.begin(115200);
+  pinMode(AMP_EN_PIN, OUTPUT);
+  digitalWrite(AMP_EN_PIN, HIGH); // keep the speaker amplifier off
+
+  Serial.begin(2000000);
   delay(1000);
-  Serial.println("\n--- AD9833 ADC DMA 50kSPS Streaming Bench ---");
-  Serial.printf("PSRAM size: %d bytes\n", ESP.getPsramSize());
+  Serial.println("\n# ESP32-S3 CYD (ES3C28P) ES8311 24-bit / 44.1kHz stream");
+  Serial.printf("# MCLK=%d BCLK=%d WS=%d SD=%d channel=%s\n", I2S_MCLK_PIN,
+                I2S_BCLK_PIN, I2S_WS_PIN, I2S_DATA_PIN,
+                MIC_USE_LEFT_CHANNEL ? "LEFT" : "RIGHT");
+  Serial.printf("# sample_rate=%u frame_samples=%u full_scale=%.0f\n",
+                SAMPLE_RATE_HZ, SAMPLES_PER_FRAME, MIC_FULL_SCALE);
 
-  pinMode(FSYNC_PIN, OUTPUT);
-  digitalWrite(FSYNC_PIN, HIGH);
-  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, FSYNC_PIN);
-
-  SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE2));
-  writeAD9833(0x2100);
-  writeAD9833(0x69F1);
-  writeAD9833(0x4000);
-  writeAD9833(0xC000);
-  writeAD9833(0x2000);
-  SPI.endTransaction();
-
-  // NOTE: do NOT call analogRead()/analogReadMilliVolts() here — it puts
-  // ADC1 into oneshot mode and makes analogContinuous() abort.
-  const uint8_t adc_pins[] = {ADC_PIN};
-  analogContinuousSetAtten(ADC_11db); // full range
-  analogContinuousSetWidth(12);       // 12-bit (0-4095)
-  if (!analogContinuous(adc_pins, 1, 1, SAMPLING_FREQUENCY, NULL)) {
-    Serial.println("# Error: analogContinuous init failed!");
-  }
-  analogContinuousStart();
-
-  adc_continuous_result_t *dbg = NULL;
-  for (int i = 0; i < 5; i++) {
-    int dma_raw = -1, dma_mv = -1;
-    if (analogContinuousRead(&dbg, 100)) {
-      dma_raw = dbg->avg_read_raw;
-      dma_mv = dbg->avg_read_mvolts;
+  Wire.begin(CODEC_SDA_PIN, CODEC_SCL_PIN, 400000);
+  if (!setupI2SMic()) {
+    Serial.println("# fatal: I2S init failed");
+    while (true) {
+      delay(1000);
     }
-    Serial.printf("#   pin=%u ch=%u dma_raw=%d dma_mV=%d\n",
-                  dbg ? dbg->pin : 255, dbg ? dbg->channel : 255, dma_raw,
-                  dma_mv);
-    delay(200);
   }
+
+  if (!setupES8311()) {
+    Serial.println("# fatal: ES8311 I2C configuration failed (check 0x18 wiring)");
+    while (true) {
+      delay(1000);
+    }
+  }
+  Serial.println("# ES8311 configured");
+
+  spectrum::begin(SAMPLE_RATE_HZ);
+  display::begin();
+
+  audio_queue = xQueueCreate(1, sizeof(analysis_block));
+  if (audio_queue == nullptr) {
+    Serial.println("# fatal: could not create audio queue");
+    while (true) {
+      delay(1000);
+    }
+  }
+  xTaskCreatePinnedToCore(analysisTask, "analysis", 8192, nullptr, 1, nullptr, 0);
+
+  Serial.println("# display ready");
 }
 
-static int get_folded_bin(int bin, int N) {
-  bin = bin % N;
-  if (bin > N / 2) {
-    bin = N - bin;
-  }
-  return bin;
-}
-
-void analyzeAndStream() {
-  double *raw_samples = (double *)malloc(SAMPLES * sizeof(double));
-  if (!raw_samples) {
-    Serial.println("# Error: malloc failed");
+void loop() {
+  const int64_t t0 = esp_timer_get_time();
+  if (!captureFrame()) {
     return;
   }
+  const int64_t t1 = esp_timer_get_time();
 
-  // Collect one block from the DMA queue (already hardware-timed)
-  adc_continuous_result_t *adc_result = NULL;
-  size_t got = 0;
-  uint32_t t0 = millis();
-  while (got < SAMPLES) {
-    if (analogContinuousRead(&adc_result, 100)) {
-      raw_samples[got++] = (double)adc_result->avg_read_raw;
-    } else if (millis() - t0 > 2000) {
-      Serial.println("# Error: ADC DMA timeout");
-      free(raw_samples);
-      return;
-    }
+  // Overwrite: the analyser always gets the most recent block, and capture
+  // never waits for it.
+  xQueueOverwrite(audio_queue, sample_buffer);
+
+  // Throughput check: 46.4 ms per 2048-sample block means 21.5 frames/s.
+  static uint32_t frames = 0;
+  static uint32_t last_report = 0;
+  static uint64_t cap_us = 0;
+  ++frames;
+  cap_us += static_cast<uint64_t>(t1 - t0);
+  const uint32_t now = millis();
+  if (now - last_report >= 5000) {
+    const float fps = frames * 1000.0f / (now - last_report);
+    Serial.printf("# fps=%.1f capture=%.1fms analysis=%.1fms dba=%.1f spl=%.1f\n",
+                  fps, cap_us / 1000.0f / frames,
+                  stat_analysis_us / 1000.0f, spectrum::dba(),
+                  spectrum::spl());
+    frames = 0;
+    cap_us = 0;
+    last_report = now;
   }
-
-  // --- Stream raw block to host (binary frame) ---
-  sendFrame(raw_samples, SAMPLES);
-
-  // --- On-board IEEE 1241 analysis (text output, '#' prefixed) ---
-  for (int i = 0; i < SAMPLES; i++) {
-    vReal[i] = raw_samples[i];
-    vImag[i] = 0.0;
-  }
-  FFT.windowing(FFTWindow::Hann, FFTDirection::Forward);
-  FFT.compute(FFTDirection::Forward);
-
-  double max_mag_sq = 0.0;
-  int fund_bin = 0;
-  for (int i = 4; i < SAMPLES / 2; i++) {
-    double mag_sq = vReal[i] * vReal[i] + vImag[i] * vImag[i];
-    if (mag_sq > max_mag_sq) {
-      max_mag_sq = mag_sq;
-      fund_bin = i;
-    }
-  }
-
-  double omega = 2.0 * PI * fund_bin / SAMPLES;
-  double A = 0, B = 0, C = 0; // Model: y = A*cos(w*n) + B*sin(w*n) + C
-
-  auto solve3 = [&](double w, double &a_out, double &b_out, double &c_out) {
-    double m[3][3] = {0};
-    double yv[3] = {0};
-    for (int n = 0; n < SAMPLES; n++) {
-      double c = cos(w * n), s = sin(w * n), y = raw_samples[n];
-      m[0][0] += c * c;
-      m[0][1] += c * s;
-      m[0][2] += c;
-      m[1][0] += c * s;
-      m[1][1] += s * s;
-      m[1][2] += s;
-      m[2][0] += c;
-      m[2][1] += s;
-      m[2][2] += 1.0;
-      yv[0] += y * c;
-      yv[1] += y * s;
-      yv[2] += y;
-    }
-    double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
-                 m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
-                 m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-    a_out = (yv[0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
-             m[0][1] * (yv[1] * m[2][2] - m[1][2] * yv[2]) +
-             m[0][2] * (yv[1] * m[2][1] - m[1][1] * yv[2])) /
-            det;
-    b_out = (m[0][0] * (yv[1] * m[2][2] - m[1][2] * yv[2]) -
-             yv[0] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
-             m[0][2] * (m[1][0] * yv[2] - yv[1] * m[2][0])) /
-            det;
-    c_out = (m[0][0] * (m[1][1] * yv[2] - yv[1] * m[2][1]) -
-             m[0][1] * (m[1][0] * yv[2] - yv[1] * m[2][0]) +
-             yv[0] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])) /
-            det;
-  };
-
-  solve3(omega, A, B, C);
-
-  // 4-Parameter Iteration (Newton-Raphson)
-  for (int iter = 0; iter < 10; iter++) {
-    double m[4][4] = {0};
-    double yv[4] = {0};
-    for (int n = 0; n < SAMPLES; n++) {
-      double arg = omega * n;
-      double c_val = cos(arg), s_val = sin(arg);
-      double d_omega = -A * n * s_val + B * n * c_val;
-      double y_est = A * c_val + B * s_val + C;
-      double res = raw_samples[n] - y_est;
-
-      double row[4] = {c_val, s_val, 1.0, d_omega};
-      for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++)
-          m[i][j] += row[i] * row[j];
-        yv[i] += res * row[i];
-      }
-    }
-
-    for (int i = 0; i < 4; i++) {
-      int pivot = i;
-      for (int j = i + 1; j < 4; j++)
-        if (fabs(m[j][i]) > fabs(m[pivot][i]))
-          pivot = j;
-      for (int j = 0; j < 4; j++)
-        std::swap(m[i][j], m[pivot][j]);
-      std::swap(yv[i], yv[pivot]);
-      double piv = m[i][i];
-      if (fabs(piv) < 1e-15)
-        continue;
-      for (int j = i; j < 4; j++)
-        m[i][j] /= piv;
-      yv[i] /= piv;
-      for (int j = 0; j < 4; j++) {
-        if (i != j) {
-          double factor = m[j][i];
-          for (int k = i; k < 4; k++)
-            m[j][k] -= factor * m[i][k];
-          yv[j] -= factor * yv[i];
-        }
-      }
-    }
-    A += yv[0];
-    B += yv[1];
-    C += yv[2];
-    omega += yv[3];
-    if (fabs(yv[3]) < 1e-10)
-      break;
-  }
-
-  double amplitude = sqrt(A * A + B * B);
-  double phase = atan2(-B, A);
-
-  Serial.println("# --- IEEE 1241 4-Param Sine Fit ---");
-  Serial.printf("# Fitted Frequency  : %.4f Hz\n",
-                (omega * SAMPLING_FREQUENCY) / (2.0 * PI));
-  Serial.printf("# Refined DC Offset : %.3f LSB\n", C);
-  Serial.printf("# Fitted Amplitude  : %.3f LSB\n", amplitude);
-  Serial.printf("# Fitted Phase(rad) : %.4f\n", phase);
-
-  // --- Golden Reference & LUT Training ---
-  double *ideal_samples = (double *)malloc(SAMPLES * sizeof(double));
-  const int ADC_MAX_CODE = 4096;
-  double *LUT = (double *)calloc(ADC_MAX_CODE, sizeof(double));
-  int *count = (int *)calloc(ADC_MAX_CODE, sizeof(int));
-  if (!ideal_samples || !LUT || !count) {
-    free(raw_samples);
-    return;
-  }
-
-  for (int n = 0; n < SAMPLES; n++)
-    ideal_samples[n] = amplitude * cos(omega * n + phase);
-
-  for (int n = 0; n < SAMPLES; n++) {
-    int code = (int)raw_samples[n];
-    if (code < 0)
-      code = 0;
-    if (code >= ADC_MAX_CODE)
-      code = ADC_MAX_CODE - 1;
-    LUT[code] += (ideal_samples[n] - (raw_samples[n] - C));
-    count[code]++;
-  }
-  for (int i = 0; i < ADC_MAX_CODE; i++)
-    if (count[i] > 0)
-      LUT[i] /= count[i];
-
-  // --- Calibrated metrics ---
-  double *calibrated_samples = (double *)malloc(SAMPLES * sizeof(double));
-  for (int n = 0; n < SAMPLES; n++) {
-    int code = (int)raw_samples[n];
-    if (code < 0)
-      code = 0;
-    if (code >= ADC_MAX_CODE)
-      code = ADC_MAX_CODE - 1;
-    calibrated_samples[n] = (raw_samples[n] - C) + LUT[code];
-    vReal[n] = calibrated_samples[n];
-    vImag[n] = 0.0;
-  }
-
-  FFT.windowing(FFTWindow::Hann, FFTDirection::Forward);
-  FFT.compute(FFTDirection::Forward);
-  FFT.complexToMagnitude();
-
-  const int num_bins = SAMPLES / 2;
-  double *pow_spec = (double *)malloc(num_bins * sizeof(double));
-  double *noise_m = (double *)malloc(num_bins * sizeof(double));
-  for (int i = 0; i < num_bins; i++) {
-    pow_spec[i] = vReal[i] * vReal[i];
-    noise_m[i] = 1.0;
-  }
-
-  int ws = 3;
-  double p_sig = 0, p_harm = 0, p_noi = 0, p_spur = 0;
-  int sig_b = floor((omega * SAMPLES) / (2.0 * PI) + 0.5);
-  for (int i = sig_b - ws; i <= sig_b + ws; i++)
-    if (i >= 0 && i < num_bins) {
-      p_sig += pow_spec[i];
-      noise_m[i] = 0;
-    }
-  for (int i = 0; i <= ws; i++)
-    noise_m[i] = 0;
-
-  for (int h = 2; h <= 6; h++) {
-    int hb = get_folded_bin(sig_b * h, SAMPLES);
-    for (int i = hb - ws; i <= hb + ws; i++)
-      if (i >= 0 && i < num_bins) {
-        if (noise_m[i] == 1.0)
-          p_harm += pow_spec[i];
-        noise_m[i] = 0;
-      }
-  }
-
-  double pmax = 0;
-  int spb = 0;
-  for (int i = 0; i < num_bins; i++)
-    if (noise_m[i] == 1.0) {
-      p_noi += pow_spec[i];
-      if (pow_spec[i] > pmax) {
-        pmax = pow_spec[i];
-        spb = i;
-      }
-    }
-  for (int i = spb - ws; i <= spb + ws; i++)
-    if (i >= 0 && i < num_bins && noise_m[i] == 1.0)
-      p_spur += pow_spec[i];
-
-  double snr = 10 * log10(p_sig / p_noi), thd = 10 * log10(p_harm / p_sig),
-         sndr = 10 * log10(p_sig / (p_noi + p_harm)),
-         enob = (sndr - 1.76) / 6.02;
-
-  Serial.println("# --- Calibrated Metrics ---");
-  Serial.printf("# SNR: %.2f dB, THD: %.2f dB, SNDR: %.2f dB, ENOB: %.2f "
-                "bits\n",
-                snr, thd, sndr, enob);
-  Serial.println("# =========================");
-
-  free(raw_samples);
-  free(ideal_samples);
-  free(LUT);
-  free(count);
-  free(calibrated_samples);
-  free(pow_spec);
-  free(noise_m);
 }
-
-void loop() { analyzeAndStream(); }
